@@ -58,7 +58,7 @@ func main() {
 		deviceNames = append(deviceNames, d.Name)
 	}
 	micSelect.Options = deviceNames
-	if len(deviceNames) == 1 {
+	if len(deviceNames) > 0 {
 		micSelect.SetSelected(deviceNames[0])
 	}
 	if len(deviceNames) == 0 {
@@ -89,9 +89,9 @@ func main() {
 	whisperEngine.SetLanguage("auto")
 	log.Printf("Whisper 引擎初始化: dir=%s, model=%s", whisperDir, modelPath)
 
-	// --- LLM polisher ---
+	// --- LLM polisher + config ---
 	cfgPath := filepath.Join(exeDir, "config.json")
-	polisher := initPolisher(cfgPath)
+	polisher, saveAudio := loadConfig(cfgPath)
 
 	// shared toggle: button + hotkey both call this
 	toggle := func() {
@@ -103,7 +103,6 @@ func main() {
 				log.Println("无可用录音设备")
 				return
 			}
-			// Find selected device
 			sel := micSelect.Selected
 			devID := devices[0].ID // fallback
 			for _, d := range devices {
@@ -125,11 +124,7 @@ func main() {
 			recordBtn.Refresh()
 
 		case stateRecording:
-			// --- stop recording & save WAV ---
-			recordBtn.SetText("处理中...")
-			recordBtn.Importance = widget.HighImportance
-			recordBtn.Refresh()
-
+			// --- stop recording ---
 			pcm, err := rec.Stop()
 			if err != nil {
 				log.Printf("录音停止失败: %v", err)
@@ -139,15 +134,70 @@ func main() {
 				recordBtn.Refresh()
 				return
 			}
+			durationSec := float64(len(pcm)) / float64(audio.SampleRate*audio.BytesPerFrame)
 			log.Printf("录音停止，PCM 数据大小: %d bytes (%d 帧, %.1f 秒)",
-				len(pcm), len(pcm)/2, float64(len(pcm))/float64(audio.SampleRate*audio.BytesPerFrame))
-			if len(pcm) == 0 {
-				log.Println("警告: PCM 数据为空，WAV 文件将只有头部")
+				len(pcm), len(pcm)/2, durationSec)
+
+			// --- duration checks ---
+
+			// < 1s: discard with feedback
+			if durationSec < 1.0 {
+				log.Printf("录音时长 %.1f 秒 < 1秒，丢弃", durationSec)
+				curr = stateIdle
+				recordBtn.SetText("录音太短")
+				recordBtn.Importance = widget.MediumImportance
+				recordBtn.Refresh()
+				go func() {
+					time.Sleep(2 * time.Second)
+					fyne.Do(func() {
+						if curr == stateIdle {
+							recordBtn.SetText("开始录音")
+							recordBtn.Refresh()
+						}
+					})
+				}()
+				return
 			}
 
-			// Save WAV to exe directory
-			filename := fmt.Sprintf("recording_%s.wav", time.Now().Format("20060102_150405"))
-			wavPath := filepath.Join(exeDir, filename)
+			// > 10 min (600s): discard with feedback
+			if durationSec > 600 {
+				log.Printf("录音时长 %.1f 秒 > 10分钟，丢弃", durationSec)
+				curr = stateIdle
+				recordBtn.SetText("录音过长")
+				recordBtn.Importance = widget.MediumImportance
+				recordBtn.Refresh()
+				go func() {
+					time.Sleep(2 * time.Second)
+					fyne.Do(func() {
+						if curr == stateIdle {
+							recordBtn.SetText("开始录音")
+							recordBtn.Refresh()
+						}
+					})
+				}()
+				return
+			}
+
+			// 2-10 min: warning that processing may take time
+			if durationSec > 120 {
+				log.Printf("录音时长 %.1f 秒 (2-10分钟)，转写可能需要一些时间", durationSec)
+			}
+
+			// --- processing state ---
+			recordBtn.SetText("处理中...")
+			recordBtn.Importance = widget.HighImportance
+			recordBtn.Refresh()
+
+			// --- save WAV (temp file if saveAudio disabled) ---
+			var wavPath string
+			if saveAudio {
+				filename := fmt.Sprintf("recording_%s.wav", time.Now().Format("20060102_150405"))
+				wavPath = filepath.Join(exeDir, filename)
+			} else {
+				tmpDir := os.TempDir()
+				filename := fmt.Sprintf("gibbonass_%s.wav", time.Now().Format("20060102_150405"))
+				wavPath = filepath.Join(tmpDir, filename)
+			}
 			if err := audio.WriteWAV(wavPath, pcm); err != nil {
 				log.Printf("保存 WAV 文件失败: %v", err)
 			} else {
@@ -166,7 +216,7 @@ func main() {
 					log.Printf("[stt] 转写结果: %q", text)
 					log.Printf("[stt] 转写字符数: %d", len(text))
 
-					// LLM 润色（如果已配置）
+					// LLM polish (if configured)
 					if polisher.IsConfigured() {
 						log.Printf("[llm] 开始润色...")
 						polished, err := polisher.Polish(text)
@@ -195,7 +245,6 @@ func main() {
 							log.Printf("[clip] 模拟 Ctrl+V 粘贴...")
 							clip.SendCtrlV()
 
-							// 等待粘贴完成，然后恢复原剪贴板
 							time.Sleep(150 * time.Millisecond)
 							if prevClip != "" {
 								if err := clip.SetText(prevClip); err != nil {
@@ -205,6 +254,15 @@ func main() {
 								}
 							}
 						}
+					}
+				}
+
+				// Cleanup temp WAV if not saving
+				if !saveAudio {
+					if err := os.Remove(wavPathCopy); err != nil {
+						log.Printf("[cleanup] 删除临时 WAV 文件失败: %v", err)
+					} else {
+						log.Printf("[cleanup] 已删除临时 WAV 文件: %s", wavPathCopy)
 					}
 				}
 
@@ -228,28 +286,26 @@ func main() {
 	// --- layout ---
 	content := container.NewPadded(
 		container.NewVBox(
-			widget.NewLabelWithStyle("选择麦克风", fyne.TextAlignLeading, fyne.TextStyle{}),
 			micSelect,
 			recordBtn,
 		),
 	)
 
 	w.SetContent(content)
-	w.Resize(fyne.NewSize(320, 150))
+	w.Resize(fyne.NewSize(320, 100))
 	w.SetFixedSize(true)
 
 	// --- global hotkey: Ctrl + Left Alt (polling) + ESC cancel ---
 	log.Println("启动热键监听 goroutine")
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// ESC 取消录音
 	cancelRecording := func() {
 		log.Println("[hotkey] ESC 触发")
 		if curr != stateRecording || rec == nil {
 			return
 		}
 		log.Println("[hotkey] ESC 取消录音，丢弃音频")
-		rec.Stop() // 释放 waveIn 设备，丢弃 PCM
+		rec.Stop()
 		rec = nil
 		curr = stateIdle
 		recordBtn.SetText("开始录音")
@@ -272,23 +328,24 @@ func main() {
 	w.ShowAndRun()
 }
 
-// initPolisher loads config.json and creates an LLM polisher.
-func initPolisher(cfgPath string) *llm.Polisher {
+// loadConfig reads config.json and returns LLM polisher + save_audio flag.
+func loadConfig(cfgPath string) (*llm.Polisher, bool) {
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
-		log.Printf("[llm] 无法读取配置文件 %s: %v（跳过润色）", cfgPath, err)
-		return llm.NewPolisher(llm.Config{})
+		log.Printf("[config] 无法读取配置文件 %s: %v（跳过润色）", cfgPath, err)
+		return llm.NewPolisher(llm.Config{}), true
 	}
 
 	var cfg struct {
-		URL    string `json:"llm_url"`
-		Key    string `json:"llm_key"`
-		Model  string `json:"llm_model"`
-		Prompt string `json:"llm_prompt"`
+		URL       string `json:"llm_url"`
+		Key       string `json:"llm_key"`
+		Model     string `json:"llm_model"`
+		Prompt    string `json:"llm_prompt"`
+		SaveAudio bool   `json:"save_audio"`
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		log.Printf("[llm] 配置文件解析失败: %v（跳过润色）", err)
-		return llm.NewPolisher(llm.Config{})
+		log.Printf("[config] 配置文件解析失败: %v（跳过润色）", err)
+		return llm.NewPolisher(llm.Config{}), true
 	}
 
 	p := llm.NewPolisher(llm.Config{
@@ -298,11 +355,12 @@ func initPolisher(cfgPath string) *llm.Polisher {
 		Prompt: cfg.Prompt,
 	})
 	if p.IsConfigured() {
-		log.Printf("[llm] 润色引擎已配置: model=%s, url=%s", cfg.Model, cfg.URL)
+		log.Printf("[config] LLM 润色引擎已配置: model=%s, url=%s", cfg.Model, cfg.URL)
 	} else {
-		log.Printf("[llm] 润色引擎未配置（llm_url/llm_key 为空）")
+		log.Printf("[config] LLM 润色引擎未配置（llm_url/llm_key 为空）")
 	}
-	return p
+	log.Printf("[config] 音频保存: %v", cfg.SaveAudio)
+	return p, cfg.SaveAudio
 }
 
 // hotkeyLoop polls Ctrl+Left Alt for toggle, ESC for cancel.
@@ -319,7 +377,6 @@ func hotkeyLoop(ctx context.Context, onHotkey func(), onCancel func()) {
 		default:
 		}
 
-		// Ctrl + Left Alt
 		ctrl, _, _ := procGetAsyncKeyState.Call(VK_CONTROL)
 		alt, _, _ := procGetAsyncKeyState.Call(VK_LMENU)
 		both := ctrl&0x8000 != 0 && alt&0x8000 != 0
@@ -328,7 +385,6 @@ func hotkeyLoop(ctx context.Context, onHotkey func(), onCancel func()) {
 		}
 		prevHotkey = both
 
-		// ESC (录音中取消)
 		esc, _, _ := procGetAsyncKeyState.Call(VK_ESCAPE)
 		escDown := esc&0x8000 != 0
 		if escDown && !prevEsc {

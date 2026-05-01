@@ -1,7 +1,8 @@
 {
   "_comment": "GibbonAss 配置文件 — 请填写你的 LLM 信息",
-  "llm_url": "-",
-  "llm_key": "sk-",
-  "llm_model": "-",
-  "llm_prompt": "你是中文语音转文字后处理助手，请修正错别字、补全语义、处理语气词，并给出更通顺准确的表达。"
+  "llm_url": "xxx",
+  "llm_key": "sk-xxx",
+  "llm_model": "xxx",
+  "llm_prompt": "你是中文语音转文字后处理助手，请修正错别字、补全语义、处理语气词，并给出更通顺准确的表达。",
+  "save_audio": false
 }
