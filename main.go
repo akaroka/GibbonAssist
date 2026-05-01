@@ -16,6 +16,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"GibbonAss/audio"
+	"GibbonAss/clip"
 	"GibbonAss/llm"
 	"GibbonAss/stt"
 )
@@ -29,6 +30,7 @@ var (
 const (
 	VK_CONTROL = 0x11
 	VK_LMENU   = 0xA4
+	VK_ESCAPE  = 0x1B
 )
 
 type state int
@@ -152,7 +154,7 @@ func main() {
 				log.Printf("录音已保存: %s (%d bytes)", wavPath, len(pcm))
 			}
 
-			// --- transcribe + polish in background ---
+			// --- transcribe + polish + output in background ---
 			curr = stateProcessing
 			wavPathCopy := wavPath
 			go func() {
@@ -176,6 +178,33 @@ func main() {
 						}
 					} else {
 						log.Printf("[llm] 未配置（llm_url/llm_key 为空），跳过润色")
+					}
+
+					// --- clipboard + paste ---
+					if text != "" {
+						log.Printf("[clip] 保存当前剪贴板内容")
+						prevClip, err := clip.GetText()
+						if err != nil {
+							log.Printf("[clip] 读取剪贴板失败: %v（继续）", err)
+						}
+
+						log.Printf("[clip] 写入转写结果到剪贴板")
+						if err := clip.SetText(text); err != nil {
+							log.Printf("[clip] 写入剪贴板失败: %v", err)
+						} else {
+							log.Printf("[clip] 模拟 Ctrl+V 粘贴...")
+							clip.SendCtrlV()
+
+							// 等待粘贴完成，然后恢复原剪贴板
+							time.Sleep(150 * time.Millisecond)
+							if prevClip != "" {
+								if err := clip.SetText(prevClip); err != nil {
+									log.Printf("[clip] 恢复原剪贴板失败: %v", err)
+								} else {
+									log.Printf("[clip] 已恢复原剪贴板内容 (%d 字符)", len(prevClip))
+								}
+							}
+						}
 					}
 				}
 
@@ -209,12 +238,30 @@ func main() {
 	w.Resize(fyne.NewSize(320, 150))
 	w.SetFixedSize(true)
 
-	// --- global hotkey: Ctrl + Left Alt (polling) ---
+	// --- global hotkey: Ctrl + Left Alt (polling) + ESC cancel ---
 	log.Println("启动热键监听 goroutine")
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// ESC 取消录音
+	cancelRecording := func() {
+		log.Println("[hotkey] ESC 触发")
+		if curr != stateRecording || rec == nil {
+			return
+		}
+		log.Println("[hotkey] ESC 取消录音，丢弃音频")
+		rec.Stop() // 释放 waveIn 设备，丢弃 PCM
+		rec = nil
+		curr = stateIdle
+		recordBtn.SetText("开始录音")
+		recordBtn.Importance = widget.MediumImportance
+		recordBtn.Refresh()
+	}
+
 	go hotkeyLoop(ctx, func() {
 		log.Println("onHotkey 回调执行")
 		fyne.Do(toggle)
+	}, func() {
+		fyne.Do(cancelRecording)
 	})
 
 	w.SetCloseIntercept(func() {
@@ -258,12 +305,13 @@ func initPolisher(cfgPath string) *llm.Polisher {
 	return p
 }
 
-// hotkeyLoop polls Ctrl + Left Alt using GetAsyncKeyState
-func hotkeyLoop(ctx context.Context, onHotkey func()) {
+// hotkeyLoop polls Ctrl+Left Alt for toggle, ESC for cancel.
+func hotkeyLoop(ctx context.Context, onHotkey func(), onCancel func()) {
 	log.Println("[hotkeyLoop] 启动")
 	defer log.Println("[hotkeyLoop] 退出")
 
-	prev := false
+	prevHotkey := false
+	prevEsc := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -271,14 +319,22 @@ func hotkeyLoop(ctx context.Context, onHotkey func()) {
 		default:
 		}
 
+		// Ctrl + Left Alt
 		ctrl, _, _ := procGetAsyncKeyState.Call(VK_CONTROL)
 		alt, _, _ := procGetAsyncKeyState.Call(VK_LMENU)
 		both := ctrl&0x8000 != 0 && alt&0x8000 != 0
-
-		if both && !prev {
+		if both && !prevHotkey {
 			onHotkey()
 		}
-		prev = both
+		prevHotkey = both
+
+		// ESC (录音中取消)
+		esc, _, _ := procGetAsyncKeyState.Call(VK_ESCAPE)
+		escDown := esc&0x8000 != 0
+		if escDown && !prevEsc {
+			onCancel()
+		}
+		prevEsc = escDown
 
 		time.Sleep(50 * time.Millisecond)
 	}
