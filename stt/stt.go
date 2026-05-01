@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Whisper handles speech-to-text using whisper-cli.exe.
@@ -45,6 +46,7 @@ func (w *Whisper) Transcribe(wavPath string) (string, error) {
 		"-l", w.language,
 	)
 	cmd.Dir = w.workDir // DLLs loaded from here
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
