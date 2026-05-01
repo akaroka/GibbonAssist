@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"GibbonAss/audio"
+	"GibbonAss/llm"
+	"GibbonAss/stt"
 )
 
 // Windows API
@@ -75,6 +78,18 @@ func main() {
 		}
 		return filepath.Dir(exe)
 	}()
+
+	// --- whisper engine ---
+	whisperDir := filepath.Join(exeDir, "whisper")
+	modelPath := filepath.Join(exeDir, "models", "ggml.bin")
+
+	whisperEngine := stt.NewWhisper(whisperDir, modelPath)
+	whisperEngine.SetLanguage("auto")
+	log.Printf("Whisper 引擎初始化: dir=%s, model=%s", whisperDir, modelPath)
+
+	// --- LLM polisher ---
+	cfgPath := filepath.Join(exeDir, "config.json")
+	polisher := initPolisher(cfgPath)
 
 	// shared toggle: button + hotkey both call this
 	toggle := func() {
@@ -137,16 +152,41 @@ func main() {
 				log.Printf("录音已保存: %s (%d bytes)", wavPath, len(pcm))
 			}
 
-			// Auto revert to idle after 2s (mimicking processing)
+			// --- transcribe + polish in background ---
 			curr = stateProcessing
+			wavPathCopy := wavPath
 			go func() {
-				time.Sleep(2 * time.Second)
-				if curr == stateProcessing {
-					curr = stateIdle
-					recordBtn.SetText("开始录音")
-					recordBtn.Importance = widget.MediumImportance
-					recordBtn.Refresh()
+				log.Printf("[stt] 开始转写: %s", wavPathCopy)
+				text, err := whisperEngine.Transcribe(wavPathCopy)
+				if err != nil {
+					log.Printf("[stt] 转写失败: %v", err)
+				} else {
+					log.Printf("[stt] 转写结果: %q", text)
+					log.Printf("[stt] 转写字符数: %d", len(text))
+
+					// LLM 润色（如果已配置）
+					if polisher.IsConfigured() {
+						log.Printf("[llm] 开始润色...")
+						polished, err := polisher.Polish(text)
+						if err != nil {
+							log.Printf("[llm] 润色失败: %v（使用原文）", err)
+						} else {
+							log.Printf("[llm] 润色结果: %q", polished)
+							text = polished
+						}
+					} else {
+						log.Printf("[llm] 未配置（llm_url/llm_key 为空），跳过润色")
+					}
 				}
+
+				fyne.Do(func() {
+					if curr == stateProcessing {
+						curr = stateIdle
+						recordBtn.SetText("开始录音")
+						recordBtn.Importance = widget.MediumImportance
+						recordBtn.Refresh()
+					}
+				})
 			}()
 
 		case stateProcessing:
@@ -183,6 +223,39 @@ func main() {
 	})
 
 	w.ShowAndRun()
+}
+
+// initPolisher loads config.json and creates an LLM polisher.
+func initPolisher(cfgPath string) *llm.Polisher {
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		log.Printf("[llm] 无法读取配置文件 %s: %v（跳过润色）", cfgPath, err)
+		return llm.NewPolisher(llm.Config{})
+	}
+
+	var cfg struct {
+		URL    string `json:"llm_url"`
+		Key    string `json:"llm_key"`
+		Model  string `json:"llm_model"`
+		Prompt string `json:"llm_prompt"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Printf("[llm] 配置文件解析失败: %v（跳过润色）", err)
+		return llm.NewPolisher(llm.Config{})
+	}
+
+	p := llm.NewPolisher(llm.Config{
+		URL:    cfg.URL,
+		Key:    cfg.Key,
+		Model:  cfg.Model,
+		Prompt: cfg.Prompt,
+	})
+	if p.IsConfigured() {
+		log.Printf("[llm] 润色引擎已配置: model=%s, url=%s", cfg.Model, cfg.URL)
+	} else {
+		log.Printf("[llm] 润色引擎未配置（llm_url/llm_key 为空）")
+	}
+	return p
 }
 
 // hotkeyLoop polls Ctrl + Left Alt using GetAsyncKeyState
